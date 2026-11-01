@@ -29,6 +29,7 @@ using json = nlohmann::ordered_json;
 enum server_state {
     SERVER_STATE_LOADING_MODEL,  // Server is starting up, model not fully loaded yet
     SERVER_STATE_READY,          // Server is ready and model is loaded
+    SERVER_STATE_SLEEPING,       // Server is idle, model unloaded from VRAM
 };
 
 namespace {
@@ -62,9 +63,10 @@ struct server_params
     std::string inference_path = "/inference";
     std::string tmp_dir        = ".";
 
-    int32_t port          = 8080;
-    int32_t read_timeout  = 600;
-    int32_t write_timeout = 600;
+    int32_t port               = 8080;
+    int32_t read_timeout       = 600;
+    int32_t write_timeout      = 600;
+    int32_t sleep_idle_seconds = 0;
 
     bool ffmpeg_converter = false;
 };
@@ -175,6 +177,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  --inference-path PATH,                 [%-7s] Inference path for all requests\n",                         sparams.inference_path.c_str());
     fprintf(stderr, "  --convert,                             [%-7s] Convert audio to WAV, requires ffmpeg on the server\n",     sparams.ffmpeg_converter ? "true" : "false");
     fprintf(stderr, "  --tmp-dir,                             [%-7s] Temporary directory for ffmpeg transcoded files\n",         sparams.tmp_dir.c_str());
+    fprintf(stderr, "  --sleep-idle-seconds N,                [%-7d] unload model from VRAM after this many seconds of inactivity (0 = disabled)\n", sparams.sleep_idle_seconds);
     fprintf(stderr, "  -sns,      --suppress-nst              [%-7s] suppress non-speech tokens\n",                              params.suppress_nst ? "true" : "false");
     fprintf(stderr, "  -nth N,    --no-speech-thold N         [%-7.2f] no speech threshold\n",                                   params.no_speech_thold);
     fprintf(stderr, "  -ng,       --no-gpu                    [%-7s] do not use gpu\n",                                          params.use_gpu ? "false" : "true");
@@ -255,6 +258,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
         else if (                   arg == "--inference-path")  { sparams.inference_path = argv[++i]; }
         else if (                   arg == "--convert")         { sparams.ffmpeg_converter     = true; }
         else if (                   arg == "--tmp-dir")         { sparams.tmp_dir     = argv[++i]; }
+        else if (                   arg == "--sleep-idle-seconds") { sparams.sleep_idle_seconds = std::stoi(argv[++i]); }
 
         // Voice Activity Detection (VAD)
         else if (                   arg == "--vad")                         { params.vad                         = true; }
@@ -723,6 +727,14 @@ int main(int argc, char ** argv) {
     std::unique_ptr<httplib::Server> svr = std::make_unique<httplib::Server>();
     std::atomic<server_state> state{SERVER_STATE_LOADING_MODEL};
 
+    // Idle timeout tracking
+    auto get_current_time_ms = []() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    std::atomic<int64_t> last_activity_time{get_current_time_ms()};
+    std::atomic<bool> server_running{true};
+
     struct whisper_context * ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
 
     if (ctx == nullptr) {
@@ -826,6 +838,23 @@ int main(int argc, char ** argv) {
     svr->Post(sparams.request_path + sparams.inference_path, [&](const Request &req, Response &res){
         // acquire whisper model mutex lock
         std::lock_guard<std::mutex> lock(whisper_mutex);
+
+        // Check if model was unloaded due to inactivity and reload it
+        if (ctx == nullptr) {
+            fprintf(stderr, "\nModel was unloaded due to inactivity. Reloading...\n");
+            state.store(SERVER_STATE_LOADING_MODEL);
+            ctx = whisper_init_from_file_with_params(default_params.model.c_str(), cparams);
+
+            if (ctx == nullptr) {
+                fprintf(stderr, "error: failed to reload whisper context\n");
+                res.status = 500;
+                res.set_content("{\"error\":\"failed to reload model\"}", "application/json");
+                return;
+            }
+
+            whisper_ctx_init_openvino_encoder(ctx, nullptr, params.openvino_encode_device.c_str(), nullptr);
+            state.store(SERVER_STATE_READY);
+        }
 
         // first check user requested fields of the request
         if (!req.has_file("file"))
@@ -1171,6 +1200,8 @@ int main(int argc, char ** argv) {
             res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
                             "application/json");
         }
+
+        last_activity_time.store(get_current_time_ms());
     });
     svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
         std::lock_guard<std::mutex> lock(whisper_mutex);
@@ -1193,17 +1224,21 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // clean up
-        whisper_free(ctx);
+        // clean up previous context if it exists
+        if (ctx != nullptr) {
+            whisper_free(ctx);
+        }
 
         // whisper init
         ctx = whisper_init_from_file_with_params(model.c_str(), cparams);
 
-        // TODO perhaps load prior model here instead of exit
         if (ctx == nullptr) {
-            fprintf(stderr, "error: model init  failed, no model loaded must exit\n");
+            fprintf(stderr, "error: model init failed, no model loaded must exit\n");
             exit(1);
         }
+
+        // Keep track of the dynamically loaded model so the idle-reloader knows which one to wake up with
+        default_params.model = model;
 
         // initialize openvino encoder. this has no effect on whisper.cpp builds that don't have OpenVINO configured
         whisper_ctx_init_openvino_encoder(ctx, nullptr, params.openvino_encode_device.c_str(), nullptr);
@@ -1212,13 +1247,16 @@ int main(int argc, char ** argv) {
         const std::string success = "Load was successful!";
         res.set_content(success, "application/text");
 
-        // check if the model is in the file system
+        last_activity_time.store(get_current_time_ms());
     });
 
     svr->Get(sparams.request_path + "/health", [&](const Request &, Response &res){
         server_state current_state = state.load();
         if (current_state == SERVER_STATE_READY) {
             const std::string health_response = "{\"status\":\"ok\"}";
+            res.set_content(health_response, "application/json");
+        } else if (current_state == SERVER_STATE_SLEEPING) {
+            const std::string health_response = "{\"status\":\"ok\",\"sleeping\":true}";
             res.set_content(health_response, "application/json");
         } else {
             res.set_content("{\"status\":\"loading model\"}", "application/json");
@@ -1287,8 +1325,14 @@ int main(int argc, char ** argv) {
         printf("\nwhisper server listening at http://%s:%d\n\n", sparams.hostname.c_str(), sparams.port);
     }
 
+    if (sparams.sleep_idle_seconds > 0) {
+        printf("Idle timeout enabled: model will be unloaded from VRAM after %d seconds of inactivity.\n\n", sparams.sleep_idle_seconds);
+    }
+
     shutdown_handler = [&](int signal) {
         printf("\nCaught signal %d, shutting down gracefully...\n", signal);
+        server_running.store(false);
+        idle_cv.notify_all();
         if (svr) {
             svr->stop();
         }
@@ -1310,9 +1354,48 @@ int main(int argc, char ** argv) {
 
     // clean up function, to be called before exit
     auto clean_up = [&]() {
-        whisper_print_timings(ctx);
-        whisper_free(ctx);
+        if (ctx != nullptr) {
+            whisper_print_timings(ctx);
+            whisper_free(ctx);
+        }
     };
+
+    std::condition_variable idle_cv;
+    std::mutex idle_mutex;
+    std::thread idle_watcher_thread;
+
+    if (sparams.sleep_idle_seconds > 0) {
+        const int64_t idle_threshold_ms = sparams.sleep_idle_seconds * 1000LL;
+
+        idle_watcher_thread = std::thread([&]() {
+            std::unique_lock<std::mutex> lk(idle_mutex);
+            while (server_running.load()) {
+                int64_t now = get_current_time_ms();
+                int64_t last = last_activity_time.load();
+                int64_t elapsed = now - last;
+                int64_t remaining_ms = idle_threshold_ms - elapsed;
+
+                if (remaining_ms <= 0) {
+                    std::lock_guard<std::mutex> lock(whisper_mutex);
+                    if (ctx != nullptr) { 
+                        fprintf(stderr, "\nServer idle, unloading model from VRAM...\n");
+                        whisper_free(ctx);
+                        ctx = nullptr;
+                        state.store(SERVER_STATE_SLEEPING);
+                    }
+                    // Prevent the thread from spinning at 100% CPU when the model is already unloaded.
+                    // Sleep for the full threshold until new activity happens.
+                    remaining_ms = idle_threshold_ms;
+                }
+
+                // Sleep exactly for the remaining duration. 
+                // If server_running becomes false, it wakes up immediately and breaks the sleep.
+                idle_cv.wait_for(lk, std::chrono::milliseconds(remaining_ms), [&]{ 
+                    return !server_running.load(); 
+                });
+            }
+        });
+    }
 
     std::thread t([&] {
         if (!svr->listen_after_bind()) {
@@ -1324,6 +1407,10 @@ int main(int argc, char ** argv) {
 
     t.join();
 
+    server_running.store(false);
+    if (idle_watcher_thread.joinable()) {
+        idle_watcher_thread.join();
+    }
 
     clean_up();
 
