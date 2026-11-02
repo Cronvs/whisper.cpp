@@ -115,7 +115,7 @@ struct whisper_params {
     std::string language               = "en";
     std::string prompt                 = "";
     std::string font_path              = "/System/Library/Fonts/Supplemental/Courier New Bold.ttf";
-    std::string model                  = "models/ggml-base.en.bin";
+    std::string model                  = "";
     std::string response_format        = json_format;
     std::string tdrz_speaker_turn      = " [SPEAKER_TURN]"; // TODO: set from command line
     std::string openvino_encode_device = "CPU";
@@ -735,16 +735,25 @@ int main(int argc, char ** argv) {
     std::atomic<int64_t> last_activity_time{get_current_time_ms()};
     std::atomic<bool> server_running{true};
 
-    struct whisper_context * ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
+    std::condition_variable idle_cv;
+    std::mutex idle_mutex;
+    struct whisper_context * ctx = nullptr;
 
-    if (ctx == nullptr) {
-        fprintf(stderr, "error: failed to initialize whisper context\n");
-        return 3;
+    if (params.model.empty()) {
+        fprintf(stderr, "No model specified: Starting in SLEEPING state (lazy-loading model on first request)\n");
+        state.store(SERVER_STATE_SLEEPING);
+    } else {
+        ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
+
+        if (ctx == nullptr) {
+            fprintf(stderr, "error: failed to initialize whisper context\n");
+            return 3;
+        }
+
+        // initialize openvino encoder. this has no effect on whisper.cpp builds that don't have OpenVINO configured
+        whisper_ctx_init_openvino_encoder(ctx, nullptr, params.openvino_encode_device.c_str(), nullptr);
+        state.store(SERVER_STATE_READY);
     }
-
-    // initialize openvino encoder. this has no effect on whisper.cpp builds that don't have OpenVINO configured
-    whisper_ctx_init_openvino_encoder(ctx, nullptr, params.openvino_encode_device.c_str(), nullptr);
-    state.store(SERVER_STATE_READY);
 
 
     svr->set_default_headers({{"Server", "whisper.cpp"},
@@ -841,12 +850,20 @@ int main(int argc, char ** argv) {
 
         // Check if model was unloaded due to inactivity and reload it
         if (ctx == nullptr) {
-            fprintf(stderr, "\nModel was unloaded due to inactivity. Reloading...\n");
+            if (default_params.model.empty()) {
+                fprintf(stderr, "\nerror: Inference requested but no model is loaded.\n");
+                res.status = 400;
+                res.set_content("{\"error\":\"No model loaded. Please use the /load endpoint first.\"}", "application/json");
+                return;
+            }
+
+            fprintf(stderr, "\nModel is not loaded. Initializing...\n");
             state.store(SERVER_STATE_LOADING_MODEL);
             ctx = whisper_init_from_file_with_params(default_params.model.c_str(), cparams);
 
             if (ctx == nullptr) {
                 fprintf(stderr, "error: failed to reload whisper context\n");
+                state.store(SERVER_STATE_SLEEPING);
                 res.status = 500;
                 res.set_content("{\"error\":\"failed to reload model\"}", "application/json");
                 return;
@@ -1205,9 +1222,11 @@ int main(int argc, char ** argv) {
     });
     svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
         std::lock_guard<std::mutex> lock(whisper_mutex);
+        server_state prev_state = state.load();
         state.store(SERVER_STATE_LOADING_MODEL);
         if (!req.has_file("model"))
         {
+            state.store(prev_state);
             fprintf(stderr, "error: no 'model' field in the request\n");
             const std::string error_resp = "{\"error\":\"no 'model' field in the request\"}";
             res.status = 400;
@@ -1217,6 +1236,7 @@ int main(int argc, char ** argv) {
         std::string model = req.get_file_value("model").content;
         if (!is_file_exist(model.c_str()))
         {
+            state.store(prev_state);
             fprintf(stderr, "error: 'model': %s not found!\n", model.c_str());
             const std::string error_resp = "{\"error\":\"model not found!\"}";
             res.status = 400;
@@ -1233,8 +1253,12 @@ int main(int argc, char ** argv) {
         ctx = whisper_init_from_file_with_params(model.c_str(), cparams);
 
         if (ctx == nullptr) {
-            fprintf(stderr, "error: model init failed, no model loaded must exit\n");
-            exit(1);
+            state.store(SERVER_STATE_SLEEPING);
+            fprintf(stderr, "error: model init failed, no model loaded\n");
+            const std::string error_resp = "{\"error\":\"model failed to load\"}";
+            res.status = 400;
+            res.set_content(error_resp, "application/json");
+            return;
         }
 
         // Keep track of the dynamically loaded model so the idle-reloader knows which one to wake up with
@@ -1281,7 +1305,7 @@ int main(int argc, char ** argv) {
     svr->set_error_handler([](const Request &req, Response &res) {
         if (res.status == 400) {
             res.set_content("Invalid request", "text/plain");
-        } else if (res.status != 500) {
+        } else if (res.status != 500 && res.status != 503) {
             res.set_content("File Not Found (" + req.path + ")", "text/plain");
             res.status = 404;
         }
@@ -1360,8 +1384,6 @@ int main(int argc, char ** argv) {
         }
     };
 
-    std::condition_variable idle_cv;
-    std::mutex idle_mutex;
     std::thread idle_watcher_thread;
 
     if (sparams.sleep_idle_seconds > 0) {

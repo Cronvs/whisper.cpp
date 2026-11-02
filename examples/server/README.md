@@ -41,7 +41,7 @@ options:
   -dl,       --detect-language   [false  ] exit after automatically detecting language
              --prompt PROMPT     [       ] initial prompt
              --carry-initial-prompt [false  ] always prepend initial prompt
-  -m FNAME,  --model FNAME       [models/ggml-base.en.bin] model path
+  -m FNAME,  --model FNAME       [       ] model path
   -oved D,   --ov-e-device DNAME [CPU    ] the OpenVINO device used for encode inference
   -dtw MODEL --dtw MODEL         [       ] compute token-level timestamps
   --host HOST,                   [127.0.0.1] Hostname/ip-adress for the server, or a unix socket path ending in .sock
@@ -50,6 +50,7 @@ options:
   --request-path PATH,           [       ] Request path for all requests
   --inference-path PATH,         [/inference] Inference path for all requests
   --convert,                     [false  ] Convert audio to WAV, requires ffmpeg on the server
+  --sleep-idle-seconds N,        [0      ] unload model from VRAM after this many seconds of inactivity (0 = disabled)
   -sns,      --suppress-nst      [false  ] suppress non-speech tokens
   -nth N,    --no-speech-thold N [0.60   ] no speech threshold
   -nc,       --no-context        [false  ] do not use previous audio context
@@ -90,6 +91,15 @@ curl 127.0.0.1:8080/load \
 -H "Content-Type: multipart/form-data" \
 -F model="<path-to-model-file>"
 ```
+
+## Unloading the model when idle
+
+With `--sleep-idle-seconds N` the server frees the model after N seconds without a request that used it, and loads it again on the next `/inference` request.
+Requests that arrive while the model is loading wait for it. `/health` and requests rejected before they reach the model do not wake it and do not reset the timer.
+While the model is unloaded `/health` answers 200 with `{"status":"ok","sleeping":true}`.
+The model loaded again is the one given with `-m`, or the last one loaded with `/load`, if `-m` is omitted no model is loaded and will have to be manually loaded with `/load`.
+Unloading frees the model and its context. The process and the backends stay initialized, so memory they keep for themselves is not returned.
+The option has the same name and default as in the llama.cpp server, with two differences: the sleeping state is reported by `/health`, because whisper-server has no `/props`, failed load goes back to sleeping state.
 
 ## Load testing with k6
 
