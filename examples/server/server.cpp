@@ -739,8 +739,12 @@ int main(int argc, char ** argv) {
     std::mutex idle_mutex;
     struct whisper_context * ctx = nullptr;
 
-    if (params.model.empty()) {
-        fprintf(stderr, "No model specified: Starting in SLEEPING state (lazy-loading model on first request)\n");
+    if (params.model.empty() || sparams.sleep_idle_seconds > 0) {
+        if (params.model.empty()) {
+            fprintf(stderr, "No model specified: Starting in SLEEPING state (lazy-loading model on first request)\n");
+        } else {
+            fprintf(stderr, "Idle timeout enabled: Starting in SLEEPING state (lazy-loading model '%s' on first request)\n", params.model.c_str());
+        }
         state.store(SERVER_STATE_SLEEPING);
     } else {
         ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
